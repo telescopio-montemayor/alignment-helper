@@ -19,6 +19,8 @@ ENCODER_SERVER_PORT = '5000'
 RA_ENCODER_NAME = 'Encoder_RA'
 DEC_ENCODER_NAME = 'Encoder_DEC'
 
+SITE_LONGITUDE=-58.381592
+
 log = logging.getLogger('ethernet-encoder-sync')
 # The indi wrapper doesn't like when we use it from a thread other than the
 # main one, so we use a queue as a simple notification mechanism
@@ -209,6 +211,12 @@ if __name__ == '__main__':
                         default=7624,
                         help='INDI port to connect to, defaults to 7624')
 
+    parser.add_argument('--site-longitude',
+                        required=False,
+                        type=float,
+                        default=SITE_LONGITUDE,
+                        help='Site longitude in degrees')
+
     parser.add_argument('--encoder-server-host',
                         required=False,
                         type=str,
@@ -245,6 +253,9 @@ if __name__ == '__main__':
                         help='Shows debug messages')
 
     args = parser.parse_args()
+
+    # Not pretty but works
+    SITE_LONGITUDE = args.site_longitude
 
     logging.getLogger('socketIO-client').setLevel(logging.ERROR)
     if args.debug:
