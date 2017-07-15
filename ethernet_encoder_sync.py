@@ -7,6 +7,7 @@ import argparse
 import threading
 from collections import defaultdict
 
+from astropy.time import Time
 import PyIndi
 from socketIO_client import SocketIO, BaseNamespace
 
@@ -25,6 +26,51 @@ log = logging.getLogger('ethernet-encoder-sync')
 # The indi wrapper doesn't like when we use it from a thread other than the
 # main one, so we use a queue as a simple notification mechanism
 channel = queue.Queue()
+
+# From libindi/libs/indicom.c
+
+
+def range24(v):
+    res = v
+    while res < 0:
+        res += 24.0
+    while res > 24:
+        res -= 24.0
+
+    return res
+
+
+def rangeDec(decdegrees):
+    if ((decdegrees >= 270.0) and (decdegrees <= 360.0)):
+        return (decdegrees - 360.0)
+    if ((decdegrees >= 180.0) and (decdegrees < 270.0)):
+        return (180.0 - decdegrees)
+    if ((decdegrees >= 90.0) and (decdegrees < 180.0)):
+        return (180.0 - decdegrees)
+
+    return decdegrees
+
+
+def LST(longitude=None):
+    if longitude is None:
+        longitude = SITE_LONGITUDE
+    print ('LONG: ', longitude)
+    now = Time.now()
+    # XXX FIXME: traer longitud de gps o parametro
+    lst = now.sidereal_time('apparent', longitude=longitude).to_value()
+    return range24(lst)
+# First call to sidereal_time() takes a while to initialize
+LST()
+
+
+def calc_ra(deg):
+    ra = deg / 15.0
+    ra += LST()
+    return range24(ra)
+
+
+def calc_dec(deg):
+    return rangeDec(deg)
 
 
 class EncoderClient():
@@ -77,9 +123,9 @@ class EncoderClient():
             self.__on_connect()
 
         if data['name'] == self.ra_name:
-            self.ra = data['position_deg']
+            self.ra = calc_ra(data['position_deg'])
         if data['name'] == self.dec_name:
-            self.dec = data['position_deg']
+            self.dec = calc_dec(data['position_deg'])
 
         if self.has_position():
             self.__call_callbacks('position')
