@@ -2,3 +2,7 @@ pyindi-client
 eventlet
 socketIO-client==0.7.2
 astropy==2.0
+Flask
+Flask-Environments
+flask-socketio
+argparse
