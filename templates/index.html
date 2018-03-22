@@ -1,0 +1,241 @@
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <meta name="theme-color" content="#222222">
+  <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+  <title> Alineación </title>
+
+  <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/jquery-3.2.1.slim.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/popper.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/bootstrap.min.js') }}"></script>
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+</head>
+
+  <body>
+
+    <div class="container text-danger">
+
+      <div id="status">
+        <div class="row">
+          <div class="col col-sm-12">
+            <span class="label label-default invisible" id="align-ok">       Align Srv OK           </span>
+            <span class="label label-warning"           id="align-fail">     Align Srv DISCONNECTED </span>
+            <span class="label label-default invisible" id="indi-ok">        Indi OK                </span>
+            <span class="label label-warning"           id="indi-fail">      Indi DISCONNECTED      </span>
+            <span class="label label-default invisible" id="telescope-ok">   Telescope OK           </span>
+            <span class="label label-warning"           id="telescope-fail"> Telescope DISCONNECTED </span>
+          </div>
+        </div>
+
+        <div class="row">
+          <h3 class="col-sm-6 text-right">
+            RA:
+          </h3>
+          <h3 class="coord-value col" id="ra-value">  </h3>
+        </div>
+        <div class="row">
+          <h3 class="col-sm-6 text-right">
+            DEC:
+          </h3>
+          <h3 class="coord-value col" id="dec-value"> </h3>
+        </div>
+      </div>
+
+      <div class="form-group row">
+        <label class="col-sm-6 col-form-label col-form-label-sm text-right" for="offset-value">
+          Desplazamiento (grados alrededor posición actual):
+        </label>
+        <input type="number" class="btn-default text-danger" id="offset-value" value="5" min="0" step="0.1"> </input>
+      </div>
+
+      <div id="controls" class="row">
+        <div class="btn-group col col-sm-6">
+          <button class="btn btn-default text-danger" id="tracking-on">  TRACKING ON  </button>
+          <button class="btn btn-default text-danger" id="tracking-off"> TRACKING OFF </button>
+          <button class="btn btn-default text-danger" id="sync-center">  SYNC CENTRO  </button>
+        </div>
+        <div class="btn-group col col-sm-6">
+          <button class="btn btn-default text-danger" id="offset-minus"> MOVER -5     </button>
+          <button class="btn btn-default text-danger" id="offset-plus">  MOVER +5     </button>
+          <button class="btn btn-default text-danger" id="move-center">  MOVER CENTRO </button>
+        </div>
+      </div>
+
+      <div id="motion-controls">
+        <div class="row">
+          <div class="col col-sm-6">
+            <div class="row">
+              <div class="col col-sm-1 col-sm-offset-1">
+                <button class="btn btn-default glyphicon glyphicon-triangle-top text-danger"    id="move-up">    </button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="col col-sm-1">
+                <button class="btn btn-default glyphicon glyphicon-triangle-left text-danger"   id="move-left">  </button>
+              </div>
+              <div class="col col-sm-1 col-sm-offset-1">
+                <button class="btn btn-default glyphicon glyphicon-triangle-right text-danger"  id="move-right"> </button>
+              </div>
+            </div>
+
+            <div class="row">
+              <div class="col col-sm-1 col-sm-offset-1">
+                <button class="btn btn-default glyphicon glyphicon-triangle-bottom text-danger" id="move-down"> </button>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </body>
+
+  <script type="text/javascript" charset="utf-8">
+
+      var socket = io();
+      var state = {
+        offset: 5,
+        currentOffset: 0,
+      }
+
+      socket.on('connect', function(payload) {
+        socket.emit('GET_EQUATORIAL_EOD_COORD');
+        socket.emit('GET_INDI_STATUS');
+        socket.emit('GET_SCOPE_STATUS');
+        set_status('align', 'ok');
+      });
+
+      socket.on('connect_timeout',   socket_error);
+      socket.on('connect_error',     socket_error);
+      socket.on('reconnect_attempt', socket_error);
+      function socket_error(payload) {
+          set_status('indi',      'fail');
+          set_status('telescope', 'fail');
+          set_status('align',     'fail');
+      };
+
+
+      socket.on('INDI_STATUS', function(status) {
+        if (status.connected) {
+          set_status('indi',      'ok');
+        } else {
+          set_status('indi',      'fail');
+          set_status('telescope', 'fail');
+        }
+      });
+
+      socket.on('SCOPE_STATUS', function(status) {
+        if (status.connected) {
+          set_status('telescope', 'ok');
+        } else {
+          set_status('telescope', 'fail');
+        }
+      });
+
+      socket.on('EQUATORIAL_EOD_COORD', function(payload) {
+        ra_value = document.querySelector('#ra-value');
+        dec_value = document.querySelector('#dec-value');
+
+        ra_value.textContent = format_dms(payload.RA);
+        dec_value.textContent = format_dms(payload.DEC);
+      });
+
+      socket.on('DEVICE_CONNECTED', device_connected);
+      function device_connected(payload) {
+        set_status('telescope', 'ok');
+      };
+
+      socket.on('DEVICE_DISCONNECTED', device_disconnected);
+      function device_disconnected(payload) {
+        set_status('telescope', 'fail');
+      };
+
+
+      document.querySelector('#tracking-on').addEventListener('click', function() {
+        socket.emit('START_TRACKING');
+      });
+
+      document.querySelector('#tracking-off').addEventListener('click', function() {
+        socket.emit('STOP_TRACKING');
+      });
+
+      document.querySelector('#sync-center').addEventListener('click', function() {
+        socket.emit('SYNC_CENTER');
+        state.currentOffset = 0;
+      });
+
+      document.querySelector('#offset-value').addEventListener('change', function() {
+        var offset = parseFloat(this.value);
+        state.offset = offset;
+
+        document.querySelector('#offset-minus').textContent = 'MOVER -' + offset;
+        document.querySelector('#offset-plus').textContent  = 'MOVER +' + offset;
+      });
+
+      document.querySelector('#offset-minus').addEventListener('click', function() {
+        var newOffset = -state.currentOffset - state.offset;
+        state.currentOffset = -state.offset;
+
+        socket.emit('MOVE_RELATIVE', newOffset, 0);
+      });
+
+      document.querySelector('#offset-plus').addEventListener('click', function() {
+        var newOffset = -state.currentOffset + state.offset;
+        state.currentOffset = state.offset;
+
+        socket.emit('MOVE_RELATIVE', newOffset, 0);
+      });
+
+      document.querySelector('#move-center').addEventListener('click', function() {
+        var newOffset = -state.currentOffset;
+        state.currentOffset = 0;
+
+        socket.emit('MOVE_RELATIVE', newOffset, 0);
+      });
+
+
+      function set_status(target, status) {
+        var selectorOk = '#' + target + '-ok';
+        var selectorFail = '#' + target + '-fail';
+        if (status === 'ok') {
+          document.querySelector(selectorOk).classList.remove('invisible');
+          document.querySelector(selectorFail).classList.add('invisible');
+        } else {
+          document.querySelector(selectorOk).classList.add('invisible');
+          document.querySelector(selectorFail).classList.remove('invisible');
+        }
+      }
+
+
+      function format_dms(angle) {
+        var sign = "";
+
+        if (angle < 0) {
+          sign = "-";
+          angle = -angle;
+        }
+
+        var degrees = Math.floor(angle);
+        var minfloat = (angle - degrees)*60;
+        var minutes = Math.floor(minfloat);
+        var secfloat = (minfloat-minutes)*60;
+        var seconds = Math.round(secfloat);
+        // After rounding, the seconds might become 60. These two
+        // if-tests are not necessary if no rounding is done.
+        if (seconds==60) {
+        minutes++;
+        seconds=0;
+        }
+        if (minutes==60) {
+        degrees++;
+        minutes=0;
+        }
+        return (sign + degrees + ":" + minutes + ":" + seconds);
+      }
+  </script>
+</html>

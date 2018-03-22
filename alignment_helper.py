@@ -1,31 +1,53 @@
 #!/usr/bin/env python3
 
-import time
 import logging
 import queue
 import argparse
-import threading
 from collections import defaultdict
+
+from flask import Flask, render_template
+from flask.json import jsonify
+from flask_socketio import SocketIO
+
 
 from astropy.time import Time
 import PyIndi
-from socketIO_client import SocketIO, BaseNamespace
+
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+socketio = SocketIO(app)
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+SITE_LONGITUDE=-58.381592
 
 # Vega
 DEFAULT_RA  = (279.23473479 * 24.0)/360.0
 DEFAULT_DEC = +38.78368896
 
-ENCODER_SERVER_HOST = 'localhost'
-ENCODER_SERVER_PORT = '5000'
-RA_ENCODER_NAME = 'Encoder_RA'
-DEC_ENCODER_NAME = 'Encoder_DEC'
-
-SITE_LONGITUDE=-58.381592
-
-log = logging.getLogger('ethernet-encoder-sync')
+log = logging.getLogger('alignment-helper')
 # The indi wrapper doesn't like when we use it from a thread other than the
 # main one, so we use a queue as a simple notification mechanism
+indi_channel = queue.Queue()
 channel = queue.Queue()
+coords_channel = queue.Queue()
+
+SCOPE_STATUS = {
+    'RA': 0,
+    'DEC': 0,
+    'connected': False,
+}
+
+INDI_STATUS = {
+    'connected': False
+}
 
 # From libindi/libs/indicom.c
 
@@ -54,13 +76,12 @@ def rangeDec(decdegrees):
 def LST(longitude=None):
     if longitude is None:
         longitude = SITE_LONGITUDE
-    print ('LONG: ', longitude)
     now = Time.now()
     # XXX FIXME: traer longitud de gps o parametro
     lst = now.sidereal_time('apparent', longitude=longitude).to_value()
     return range24(lst)
 # First call to sidereal_time() takes a while to initialize
-LST()
+LST()   # noqa
 
 
 def calc_ra(deg):
@@ -73,73 +94,6 @@ def calc_dec(deg):
     return rangeDec(deg)
 
 
-class EncoderClient():
-    def __init__(self, host=ENCODER_SERVER_HOST, port=ENCODER_SERVER_PORT, ra_name=RA_ENCODER_NAME, dec_name=DEC_ENCODER_NAME):
-        self.host = host
-        self.port = port
-        self.ra_name = ra_name
-        self.dec_name = dec_name
-
-        self.connected = False
-        self.firstPosition = True
-        self.ra = None
-        self.dec = None
-        # name -> [function]
-        self.__callbacks = defaultdict(list)
-
-        socketIO = SocketIO(host, port, BaseNamespace)
-        socketIO.on('position', self.__on_position)
-        socketIO.on('connect', self.__on_connect)
-        socketIO.on('reconnect', self.__on_connect)
-        socketIO.on('disconnect', self.__on_disconnect)
-
-        self.listener_thread = threading.Thread(target=socketIO.wait)
-        self.listener_thread.daemon = True
-        self.listener_thread.start()
-
-    def __call_callbacks(self, name):
-        to_remove = []
-        for callback in self.__callbacks[name]:
-            ret = callback(self)
-            if not ret:
-                to_remove.append(callback)
-        for callback in to_remove:
-            self.__callbacks[name].remove(callback)
-
-    def __on_connect(self):
-        self.connected = True
-        self.__call_callbacks('connect')
-
-    def __on_disconnect(self):
-        self.connected = False
-        self.firstPosition = True
-        self.ra = None
-        self.dec = None
-        self.__call_callbacks('disconnect')
-
-    def __on_position(self, data):
-        # hackish workaround
-        if not self.connected:
-            self.__on_connect()
-
-        if data['name'] == self.ra_name:
-            self.ra = calc_ra(data['position_deg'])
-        if data['name'] == self.dec_name:
-            self.dec = calc_dec(data['position_deg'])
-
-        if self.has_position():
-            self.__call_callbacks('position')
-            if self.firstPosition:
-                self.firstPosition = False
-                self.__call_callbacks('first-position')
-
-    def on(self, name, callback):
-        self.__callbacks[name].append(callback)
-
-    def has_position(self):
-        return self.connected and (self.ra is not None) and (self.dec is not None)
-
-
 class SyncClient(PyIndi.BaseClient):
     def __init__(self, device_name='Telescope Simulator'):
         super(SyncClient, self).__init__()
@@ -147,38 +101,45 @@ class SyncClient(PyIndi.BaseClient):
         self.__device_connected = False
         self.device = None
         self.device_name = device_name
+        self.watchDevice(self.device_name)
 
     def start(self):
-        self.watchDevice(self.device_name)
         while not self.connectServer():
-            time.sleep(0.5)
+            socketio.sleep(0.5)
 
-    def sync(self, ra=DEFAULT_RA, dec=DEFAULT_DEC):
+    def __move(self, ra=DEFAULT_RA, dec=DEFAULT_DEC, on_set='sync'):
         device = self.device
         if not device:
             return
 
-        log.info('Syncing to {} {}'.format(ra, dec))
+        log.info('Moving to {} {} ({})'.format(ra, dec, on_set))
 
         while not(device.isConnected()):
-            time.sleep(0.5)
+            socketio.sleep(0.1)
         self.__device_connected = True
 
         on_coord_set = device.getSwitch("ON_COORD_SET")
         while not on_coord_set:
-            time.sleep(0.5)
+            socketio.sleep(0.1)
             on_coord_set = device.getSwitch("ON_COORD_SET")
 
         # the order below is defined in the property vector, look at the standard Properties page
         original_coord_set = [x.s for x in on_coord_set]
         on_coord_set[0].s = PyIndi.ISS_OFF  # TRACK
         on_coord_set[1].s = PyIndi.ISS_OFF  # SLEW
-        on_coord_set[2].s = PyIndi.ISS_ON   # SYNC
+        on_coord_set[2].s = PyIndi.ISS_OFF  # SYNC
+
+        switch_idx = {
+            'track': 0,
+            'slew':  1,
+            'sync':  2,
+        }.get(on_set, 1)
+        on_coord_set[switch_idx].s = PyIndi.ISS_ON
         self.sendNewSwitch(on_coord_set)
 
         radec = device.getNumber("EQUATORIAL_EOD_COORD")
         while not radec:
-            time.sleep(0.5)
+            socketio.sleep(0.1)
             radec = device.getNumber("EQUATORIAL_EOD_COORD")
 
         radec[0].value = ra
@@ -186,11 +147,69 @@ class SyncClient(PyIndi.BaseClient):
         self.sendNewNumber(radec)
 
         while (radec.s == PyIndi.IPS_BUSY):
-            time.sleep(0.5)
+            socketio.sleep(0.1)
 
         for idx, value in enumerate(original_coord_set):
             on_coord_set[idx].s = value
         self.sendNewSwitch(on_coord_set)
+
+    def sync(self, ra=DEFAULT_RA, dec=DEFAULT_DEC):
+        return self.__move(ra, dec, 'sync')
+
+    def go_to(self, ra, dec, on_set='track'):
+        return self.__move(ra, dec, on_set)
+
+    def set_tracking(self, tracking=True):
+
+        device = self.device
+        if not device:
+            return
+
+        while not(device.isConnected()):
+            socketio.sleep(0.1)
+        self.__device_connected = True
+
+        track_state = device.getSwitch("TELESCOPE_TRACK_STATE")
+        while not track_state:
+            socketio.sleep(0.1)
+            track_state = device.getSwitch("TELESCOPE_TRACK_STATE")
+
+        if tracking:
+            track_state[0].s = PyIndi.ISS_ON
+            track_state[1].s = PyIndi.ISS_OFF
+        else:
+            track_state[0].s = PyIndi.ISS_OFF
+            track_state[1].s = PyIndi.ISS_ON
+
+        self.sendNewSwitch(track_state)
+
+    def get_coords(self):
+        device = self.device
+        if not device:
+            return None
+
+        while not(device.isConnected()):
+            socketio.sleep(0.1)
+        self.__device_connected = True
+
+        radec = device.getNumber("EQUATORIAL_EOD_COORD")
+        while not radec:
+            socketio.sleep(0.1)
+            radec = device.getNumber("EQUATORIAL_EOD_COORD")
+
+        return {
+            'RA': radec[0].value,
+            'DEC': radec[1].value,
+        }
+
+    def removeDevice(self, device):
+        name = device.getDeviceName()
+        if name == self.device_name:
+            log.info('Device removed: {}'.format(name))
+            self.device = None
+            self.__device_connected = False
+            indi_channel.put(False)
+            channel.put(device)
 
     def newDevice(self, device):
         name = device.getDeviceName()
@@ -213,7 +232,11 @@ class SyncClient(PyIndi.BaseClient):
         pass
 
     def newNumber(self, nvp):
-        pass
+        if nvp.name == 'EQUATORIAL_EOD_COORD':
+            coords_channel.put({
+                'RA': nvp[0].value,
+                'DEC': nvp[1].value,
+            })
 
     def newText(self, tvp):
         pass
@@ -230,16 +253,78 @@ class SyncClient(PyIndi.BaseClient):
                 log.info('Device connected')
                 channel.put(device)
 
+            if old_status and (not self.__device_connected):
+                log.info('Device DISCONNECTED')
+                print('Device DISCONNECTED')
+                channel.put(device)
+
+
     def serverConnected(self):
         log.info('Connected to INDI Server')
-        self.__is_connected = True
+        if not self.__is_connected:
+            self.__is_connected = True
+            indi_channel.put(self.__is_connected)
 
     def serverDisconnected(self, code):
         log.info('Connection to INDI Server closed')
         self.__is_connected = False
-        self.__device_connected = False
         self.device = None
+        if self.__is_connected:
+            self.__is_connected = False
+            indi_channel.put(self.__is_connected)
         self.start()
+
+
+def coords_send_task(*args, **kwargs):
+    while True:
+        try:
+            coords = coords_channel.get_nowait()
+            socketio.emit('EQUATORIAL_EOD_COORD', coords, broadcast=True)
+            SCOPE_STATUS['RA'] = coords['RA']
+            SCOPE_STATUS['DEC'] = coords['DEC']
+        except queue.Empty:
+            pass
+        finally:
+            socketio.sleep(.1)
+
+
+def indi_monitor_task(*args, **kwargs):
+    while True:
+        try:
+            connected = indi_channel.get_nowait()
+            INDI_STATUS['connected'] = connected
+            socketio.emit('INDI_STATUS', INDI_STATUS, broadcast=True)
+        except queue.Empty:
+            pass
+        finally:
+            socketio.sleep(.1)
+
+
+def build_device_monitor_task(indiclient):
+    def device_monitor_task(*args, **kwargs):
+        while True:
+            try:
+                device = channel.get_nowait()
+                device_name = device.getDeviceName()
+                connected = device.isConnected()
+
+                SCOPE_STATUS['connected'] = connected
+                if connected:
+                    print('CONN')
+                    socketio.emit('DEVICE_CONNECTED', device_name, broadcast=True)
+                    coords = indiclient.get_coords()
+                    if coords:
+                        coords_channel.put(coords)
+                else:
+                    socketio.emit('DEVICE_DISCONNECTED', device_name, broadcast=True)
+                    print('DISC')
+
+            except queue.Empty:
+                pass
+            finally:
+                socketio.sleep(.1)
+
+    return device_monitor_task
 
 
 if __name__ == '__main__':
@@ -263,34 +348,11 @@ if __name__ == '__main__':
                         default=SITE_LONGITUDE,
                         help='Site longitude in degrees')
 
-    parser.add_argument('--encoder-server-host',
-                        required=False,
-                        type=str,
-                        default='localhost',
-                        help='Ethernet encoder server host, defaults to localhost')
-
-    parser.add_argument('--encoder-server-port',
-                        required=False,
-                        type=int,
-                        default=5000,
-                        help='Ethernet encoder server port, defaults to 5000')
-
-    parser.add_argument('--ra-encoder-name',
-                        required=False,
-                        type=str,
-                        default=RA_ENCODER_NAME,
-                        help='RA Encoder name from server')
-
-    parser.add_argument('--dec-encoder-name',
-                        required=False,
-                        type=str,
-                        default=DEC_ENCODER_NAME,
-                        help='DEC Encoder name from server')
-
     parser.add_argument('--device',
                         required=False,
                         type=str,
-                        default='Telescope Simulator',
+                        #default='Telescope Simulator',
+                        default='LX200 OnStep',
                         help='Telescope to sync, defaults to "Telescope Simulator"')
 
     parser.add_argument('--debug',
@@ -303,7 +365,6 @@ if __name__ == '__main__':
     # Not pretty but works
     SITE_LONGITUDE = args.site_longitude
 
-    logging.getLogger('socketIO-client').setLevel(logging.ERROR)
     if args.debug:
         logging.basicConfig(level=logging.DEBUG)
     else:
@@ -311,16 +372,40 @@ if __name__ == '__main__':
 
     indiclient = SyncClient(device_name=args.device)
     indiclient.setServer(args.host, args.port)
-    indiclient.start()
 
-    encoderclient = EncoderClient(host=args.encoder_server_host, port=args.encoder_server_port, ra_name=args.ra_encoder_name, dec_name=args.dec_encoder_name)
+    coords_task = socketio.start_background_task(target=coords_send_task)
+    indi_task = socketio.start_background_task(target=indi_monitor_task)
+    device_task = socketio.start_background_task(target=build_device_monitor_task(indiclient))
+    socketio.start_background_task(indiclient.start)
 
-    def on_first_position(ec):
-        indiclient.sync(encoderclient.ra, encoderclient.dec)
-        return True
-    encoderclient.on('first-position', on_first_position)
+    @socketio.on('GET_INDI_STATUS')
+    def __get_indi_status(data=None):
+        socketio.emit('INDI_STATUS', INDI_STATUS)
 
-    while True:
-        device = channel.get()
-        if encoderclient.has_position():
-            indiclient.sync(encoderclient.ra, encoderclient.dec)
+    @socketio.on('GET_EQUATORIAL_EOD_COORD')
+    @socketio.on('GET_SCOPE_STATUS')
+    def __get_coords(data=None):
+        print (SCOPE_STATUS)
+        socketio.emit('EQUATORIAL_EOD_COORD', SCOPE_STATUS)
+        socketio.emit('SCOPE_STATUS', SCOPE_STATUS, broadcast=True)
+
+    @socketio.on('START_TRACKING')
+    def __start_tracking(data=None):
+        indiclient.set_tracking(True)
+
+    @socketio.on('STOP_TRACKING')
+    def __stop_tracking(data=None):
+        indiclient.set_tracking(False)
+
+    @socketio.on('SYNC_CENTER')
+    def __stop_tracking(data=None):
+        ra = calc_ra(0)
+        indiclient.sync(ra=ra, dec=SCOPE_STATUS['DEC'])
+
+    @socketio.on('MOVE_RELATIVE')
+    def __move_relative(offset_ra=0.0, offset_dec=0.0):
+        ra = SCOPE_STATUS['RA'] + offset_ra / 15.0
+        dec = SCOPE_STATUS['DEC'] + offset_dec
+        indiclient.go_to(ra=ra, dec=dec)
+
+    socketio.run(app, host='0.0.0.0')
